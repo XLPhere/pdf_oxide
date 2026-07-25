@@ -60,18 +60,27 @@ pub enum ReadingOrder {
     Structure,
 }
 
-/// In-memory reader used by `open()` and `from_bytes()`. Wrapping in an enum
-/// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
-/// future file-backed variant can be re-introduced without touching call
-/// sites.
+/// Trait combining Seek and Read
+pub trait SeekRead: Seek + Read {}
+impl SeekRead for Cursor<Vec<u8>> {}
+impl SeekRead for std::fs::File {}
+
+/// Reader used to access pdf data
 enum PdfReader {
+    /// In-memory reader used by `open()` and `from_bytes()`.
     Memory(BufReader<Cursor<Vec<u8>>>),
+    // File reader, reading data from filesystem, used by `open_streaming()`
+    File(BufReader<std::fs::File>),
+    // Custom reader, reading data from an arbitrary source, used by `open_custom()`
+    Custom(BufReader<Box<dyn SeekRead + Send + Sync>>),
 }
 
 impl Read for PdfReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             PdfReader::Memory(r) => r.read(buf),
+            PdfReader::File(r) => r.read(buf),
+            PdfReader::Custom(r) => r.read(buf),
         }
     }
 }
@@ -80,6 +89,8 @@ impl Seek for PdfReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match self {
             PdfReader::Memory(r) => r.seek(pos),
+            PdfReader::File(r) => r.seek(pos),
+            PdfReader::Custom(r) => r.seek(pos),
         }
     }
 }
@@ -88,12 +99,16 @@ impl BufRead for PdfReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
             PdfReader::Memory(r) => r.fill_buf(),
+            PdfReader::File(r) => r.fill_buf(),
+            PdfReader::Custom(r) => r.fill_buf(),
         }
     }
 
     fn consume(&mut self, amt: usize) {
         match self {
             PdfReader::Memory(r) => r.consume(amt),
+            PdfReader::File(r) => r.consume(amt),
+            PdfReader::Custom(r) => r.consume(amt),
         }
     }
 }
@@ -935,6 +950,25 @@ impl PdfDocument {
         // entire file into memory"; this is making it true.
         let data = std::fs::read(path.as_ref())?;
         Self::from_bytes(data)
+    }
+    
+    /// Open a PDF document from a file path.
+    /// 
+    /// Same as `open`, but instead of reading all data at once, 
+    /// data is loaded from file as needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_streaming(path: impl AsRef<Path>) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::open_from_reader(PdfReader::File(BufReader::new(file)))
+    }
+    
+    /// Open a PDF document from a custom reader.
+    /// 
+    /// Same as `open`, but instead of reading all data at once, 
+    /// data is loaded from the provided reader as needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_custom(reader: Box<dyn SeekRead + Send + Sync>) -> Result<Self> {
+        Self::open_from_reader(PdfReader::Custom(BufReader::new(reader)))
     }
 
     fn open_from_reader(mut reader: PdfReader) -> Result<Self> {
